@@ -1,0 +1,120 @@
+#version 450
+
+struct DepthValue {
+  float value;
+};
+
+layout(set = 0, binding = 0, rgba32f) uniform writeonly image2D screenBuffer;
+
+layout(set = 0, binding = 1) buffer StorageDepthBuffer {
+  DepthValue DepthBuffer[];
+};
+
+layout(set = 0, binding = 2) uniform UniformRasterizationSettings {
+  vec4 uViewport;
+  vec2 uDepthRange;
+};
+
+layout(set = 0, binding = 3) uniform UniformSettings {
+  mat4x4 uModelViewProjectionMatrix;
+};
+
+const vec3 vertices[9] = vec3[9](
+  // Triangle A
+  vec3( 0.0,  0.5, 0.0),
+  vec3(-0.5, -0.5, 0.0),
+  vec3( 0.5, -0.5, 0.0),
+  // Triangle B
+  vec3(0.25 +  0.0,  0.5, -0.05),
+  vec3(0.25 + -0.5, -0.5, -0.05),
+  vec3(0.25 +  0.5, -0.5, -0.05),
+  // Triangle C
+  vec3(-0.25 +  0.0,  0.5, 0.05),
+  vec3(-0.25 + -0.5, -0.5, 0.05),
+  vec3(-0.25 +  0.5, -0.5, 0.05)
+);
+
+bool anyGreaterThanEqual(const in uvec2 a, const in uvec2 b) {
+  return a.x >= b.x || a.y >= b.y;
+}
+
+// https://www.khronos.org/registry/OpenGL/specs/gl/glspec44.core.pdf
+vec4 computeWindowCoordinates(const in vec4 pos) {
+  const float pd = 1.0 / pos.w;
+  // Viewport
+  vec4 vp = vec4(0.0);
+  vp.x = clamp(0.0 + uViewport.z * 0.5, 0.0, uViewport.z);
+  vp.y = clamp(0.0 + uViewport.w * 0.5, 0.0, uViewport.w);
+  vp.z = uViewport.z;
+  vp.w = uViewport.w;
+  // Convert to normalized device coordinates
+  vec3 ndc = vec3(0.0);
+  ndc.x = pos.x * pd;
+  ndc.y = pos.y * pd;
+  ndc.z = pos.z * pd;
+  // Convert to window coordinates
+  vec3 wdc = vec3(0.0);
+  wdc.x = ndc.x * (vp.z * 0.5) + vp.x;
+  wdc.y = ndc.y * (vp.w * 0.5) + vp.y;
+  wdc.z = ((uDepthRange.y - uDepthRange.x) * 0.5) * ndc.z + (uDepthRange.x + uDepthRange.y) * 0.5;
+  return vec4(wdc, pos.w);
+}
+
+float bary2(const in vec2 a, const in vec2 b, const in vec2 c) {
+  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+vec3 barycentrics(const in vec2 pos, const in mat3x4 primitive) {
+  const float f0 = bary2(primitive[0].xy, primitive[1].xy, primitive[2].xy);
+  const float f1 = bary2(primitive[1].xy, primitive[2].xy, primitive[0].xy);
+  const float f2 = bary2(primitive[2].xy, primitive[0].xy, primitive[1].xy);
+  const float a = bary2(primitive[1].xy, primitive[2].xy, pos.xy) / f0;
+  const float b = bary2(primitive[2].xy, primitive[0].xy, pos.xy) / f1;
+  const float c = bary2(primitive[0].xy, primitive[1].xy, pos.xy) / f2;
+  return vec3(a, b, c);
+}
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+void main() {
+  const uvec2 ipos = gl_GlobalInvocationID.xy;
+  const uint pixelIndex = ipos.y * uint(uViewport.z) + ipos.x;
+  if (anyGreaterThanEqual(ipos, uvec2(uViewport.zw))) return;
+
+  vec4 fragCoord = vec4(0.0);
+  fragCoord.x = ipos.x;
+  fragCoord.y = uViewport.w - ipos.y;
+
+  // Clear previous color
+  imageStore(screenBuffer, ivec2(ipos), vec4(0.0, 0.0, 0.0, 0.0));
+  // Clear previous depth
+  DepthBuffer[pixelIndex].value = uDepthRange.y;
+
+  for (uint primitiveIndex = 0; primitiveIndex < 3; ++primitiveIndex) {
+    const uint basePrimitiveIndex = primitiveIndex * 3;
+    // Load primitive and convert to wdc
+    mat3x4 primitive = mat3x4(0.0);
+    for (uint ii = 0; ii < 3; ++ii) {
+      const uint vertexIndex = basePrimitiveIndex + ii;
+      const vec4 vsIN = uModelViewProjectionMatrix * vec4(vertices[vertexIndex], 1.0); // gl_Position
+      primitive[ii] = computeWindowCoordinates(vsIN);
+    }
+    // Calculate barycentrics for later sampling
+    const vec3 bary = barycentrics(vec2(ipos), primitive);
+    // Check if primitive lies in pixel
+    if (bary.x < 0.0 || bary.y < 0.0 || bary.z < 0.0) continue;
+    // Retrieve fragCoord
+    fragCoord.z = dot(bary, vec3(primitive[0][2], primitive[1][2], primitive[2][2]));
+    fragCoord.w = dot(bary, vec3(primitive[0][3], primitive[1][3], primitive[2][3]));
+    // Cull based on depth range
+    if (fragCoord.z < uDepthRange.x || fragCoord.z > uDepthRange.y) continue;
+    // Retrieve depth
+    float depth = bary.x * primitive[0].z + bary.y * primitive[1].z + bary.z * primitive[2].z;
+    // Perform Z culling
+    if (DepthBuffer[pixelIndex].value < depth) continue;
+    // Write depth
+    DepthBuffer[pixelIndex].value = depth;
+    // Write color
+    imageStore(screenBuffer, ivec2(ipos), vec4(bary, 1.0));
+  }
+
+}
