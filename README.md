@@ -1,5 +1,7 @@
 # webgpu-compute-rasterizer
 
+<img src="https://i.imgur.com/pMq7g2j.png" width="384" />
+
 Instead of using the hardware rasterizer, this experiment uses a compute shader to perform rasterization.
 Note that a software rasterizer is significantly slower than a rasterizer with hardware acceleration.
 
